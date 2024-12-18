@@ -1,65 +1,188 @@
-from flask import render_template, request
-import dao
-from app import db, app
+import math
+from flask import render_template, request, redirect, jsonify, session
+import dao, utils
+from flask_login import login_user, logout_user, login_required, current_user
+from saleapp.app import app, login
+from saleapp.app.models import UserRole
 
-
-@app.route("/")
+@app.route('/')
 def index():
-    cates = dao.load_categories()
-    prods = dao.load_products()
-    return render_template("index.html", categories=cates, products=prods)
+    kw = request.args.get('kw')
+    cate_id = request.args.get('category_id')
+    page = request.args.get('page', 1)
+
+    prods = dao.load_products(kw=kw, category_id=cate_id, page=int(page))
+
+    total = dao.count_products()
+    return render_template('index.html', products=prods,
+                           pages=math.ceil(total / app.config["PAGE_SIZE"]))
+
+@app.route("/products/<product_id>")
+def details(product_id):
+    comments = dao.load_comments(product_id)
+    return render_template('details.html', product=dao.get_prod_by_id(product_id), comments=comments)
+
+@app.route("/api/products/<product_id>/comments", methods=['post'])
+@login_required
+def add_comment(product_id):
+    c = dao.add_comment(content=request.json.get('content'), product_id=product_id)
+    return jsonify({
+        "id": c.id,
+        "content": c.content,
+        "created_date": c.created_date,
+        "user": {
+            "avatar": c.user.avatar
+        }
+    })
+
+@app.route("/login", methods=['get', 'post'])
+def login_process():
+    if request.method.__eq__('POST'):
+        username = request.form.get('username')
+        password = request.form.get('password')
+
+        u = dao.auth_user(username=username, password=password)
+        if u:
+            login_user(u)
+
+            next = request.args.get('next')
+            return redirect('/' if next is None else next)
+
+    return render_template('login.html')
+
+@app.route("/login-admin", methods=['post'])
+def login_admin_process():
+    username = request.form.get('username')
+    password = request.form.get('password')
+
+    u = dao.auth_user(username=username, password=password, role=UserRole.ADMIN)
+    if u:
+        login_user(u)
+
+    return redirect('/admin')
 
 
-if __name__ == '__main__':
-    app.run(debug=True)
+@app.route("/logout")
+def logout_process():
+    logout_user()
+    return redirect('/login')
+
+
+@app.route('/register', methods=['get', 'post'])
+def register_process():
+    err_msg = ''
+    if request.method.__eq__('POST'):
+        password = request.form.get('password')
+        confirm = request.form.get('confirm')
+
+        if password.__eq__(confirm):
+            data = request.form.copy()
+            del data['confirm']
+
+            avatar = request.files.get('avatar')
+            dao.add_user(avatar=avatar, **data)
+
+            return redirect('/login')
+        else:
+            err_msg = 'Mật khẩu không khớp!'
+
+    return render_template('register.html', err_msg=err_msg)
+
+
+@app.route('/api/carts', methods=['post'])
+def add_to_cart():
+    """
+    {
+    "1": {
+        "id": "1",
+        "name": "...",
+        "price": 123,
+        "quantity": 1,
+        }, "2": {
+        "id": "2",
+        "name": "...",
+        "price": 123,
+        "quantity": 1,
+        }
+    }
+    """
+
+    cart = session.get('cart')
+    if not cart:
+        cart = {}
+
+    id = str(request.json.get("id"))
+    name = request.json.get("name")
+    price = request.json.get("price")
+
+    if id in cart:
+        cart[id]['quantity'] += 1
+    else:
+        cart[id] = {
+            "id": id,
+            "name": name,
+            "price": price,
+            "quantity": 1
+        }
+
+    session["cart"] = cart
+
+    return jsonify(utils.stats_cart(cart))
+
+@app.route("/api/carts/<product_id>", methods=['put'])
+def update_cart(product_id):
+    quantity = request.json.get('quantity', 0)
+
+    cart = session.get('cart')
+    if cart and product_id in cart:
+        cart[product_id]["quantity"] = int(quantity)
+
+    session['cart'] = cart
+
+    return jsonify(utils.cart_stats(cart))
+
+
+@app.route("/api/carts/<product_id>", methods=['delete'])
+def delete_cart(product_id):
+    cart = session.get('cart')
+    if cart and product_id in cart:
+        del cart[product_id]
+
+    session['cart'] = cart
+
+    return jsonify(utils.cart_stats(cart))
+
+
+@app.route("/api/pay", methods=['post'])
+@login_required
+def pay():
+    cart = session.get('cart')
+    try:
+        dao.add_receipt(cart)
+    except Exception as ex:
+        return jsonify({'status': 500, 'msg': str(ex)})
+    else:
+        del session['cart']
+        return jsonify({'status': 200, 'msg': 'successful'})
+
+
+@app.route('/cart')
+def cart_view():
+    return render_template('cart.html')
+
+
+@login.user_loader
+def load_user(user_id):
+    return dao.get_user_by_id(user_id)
+
+@app.context_processor
+def common_response_data():
+    return {
+        'categories': dao.load_categories(),
+        'cart_stats': utils.stats_cart(session.get('cart'))
+    }
+
+if __name__ == "__main__":
     with app.app_context():
-        db.create_all()
-        # c1 = Category(name='Mobile')
-        # c2 = Category(name='Desktop')
-        # c3 = Category(name='Tablet')
-        #
-        # db.session.add_all([c1, c2, c3])
-        # db.session.commit()
-
-    products = [{
-        "id": 1,
-        "name": "iPhone 7 Plus",
-        "description": "Apple, 32GB, RAM: 3GB, iOS13",
-        "price": 17000000,
-        "image": "https://res.cloudinary.com/dxxwcby8l/image/upload/v1647056401/ipmsmnxjydrhpo21xrd8.jpg",
-        "category_id": 1
-    }, {
-        "id": 2,
-        "name": "iPad Pro 2020",
-        "description": "Apple, 128GB, RAM: 6GB",
-        "price": 37000000,
-        "image": "https://res.cloudinary.com/dxxwcby8l/image/upload/v1646729533/zuur9gzztcekmyfenkfr.jpg",
-        "category_id": 2
-    }, {
-        "id": 3,
-        "name": "Galaxy Note 10 Plus",
-        "description": "Samsung, 64GB, RAML: 6GB",
-        "price": 24000000,
-        "image": "https://res.cloudinary.com/dxxwcby8l/image/upload/v1647248722/r8sjly3st7estapvj19u.jpg",
-        "category_id": 3
-    }, {
-        "id": 4,
-        "name": "iPhone 7 Plus",
-        "description": "Apple, 32GB, RAM: 3GB, iOS13",
-        "price": 17000000,
-        "image": "https://res.cloudinary.com/dxxwcby8l/image/upload/v1647056401/ipmsmnxjydrhpo21xrd8.jpg",
-        "category_id": 4
-    }, {
-        "id": 5,
-        "name": "iPhone 7 Plus",
-        "description": "Apple, 32GB, RAM: 3GB, iOS13",
-        "price": 17000000,
-        "image": "https://res.cloudinary.com/dxxwcby8l/image/upload/v1647056401/ipmsmnxjydrhpo21xrd8.jpg",
-        "category_id": 5
-    }]
-
-    for p in products:
-        prod = Products(**p)
-        db.session.add(prod)
-
-    db.session.commit()
+        from saleapp.app import admin
+    app.run(debug=True)
